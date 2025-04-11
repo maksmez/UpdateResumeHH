@@ -1,9 +1,9 @@
 import os
-import os
 import pickle
 import sys
 import logging
-from time import sleep
+import time
+
 import requests
 import yaml
 from selenium import webdriver
@@ -11,22 +11,17 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
-# Настройка логирования
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# Получаем абсолютный путь к директории, где находится скрипт
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# Абсолютные пути к файлам
 CONFIG_FILE = os.path.join(BASE_DIR, 'settings.yaml')
 COOKIES_FILE = os.path.join(BASE_DIR, 'hh-cookies')
 
-# Константы
 HH_LOGIN_URL = 'https://spb.hh.ru/applicant/resumes'
 TELEGRAM_API_URL = "https://api.telegram.org/bot{token}/sendMessage?chat_id={chat_id}&text={text}"
 
 
-# Настройка ChromeOptions
 def setup_driver():
     options = webdriver.ChromeOptions()
     options.add_argument("--headless")
@@ -43,7 +38,9 @@ def load_config():
             'TELEGRAM_TOKEN': 'none',
             'CHAT_ID': 'none',
             'PSWRD': 'none',
-            'EMAIL': 'none'
+            'EMAIL': 'none',
+            'TIMEOUT': 30,
+            'CAPTCHA_MAX_ATTEMPTS': 3
         }
         with open(CONFIG_FILE, 'w') as file:
             yaml.dump(config, file)
@@ -64,28 +61,81 @@ def send_message_telegram(text, config):
     requests.get(url).json()
 
 
+def send_photo_telegram(photo_path, config):
+    url = f"https://api.telegram.org/bot{config['TELEGRAM_TOKEN']}/sendPhoto"
+    with open(photo_path, "rb") as photo_file:
+        files = {"photo": photo_file}
+        data = {"chat_id": config['CHAT_ID'], "caption": "Введите текст с капчи с пробелом"}
+        response = requests.post(url, files=files, data=data)
+    return response.json()
+
+
+def wait_for_telegram_response(config):
+    timeout = config['TIMEOUT']
+    url = f"https://api.telegram.org/bot{config['TELEGRAM_TOKEN']}/getUpdates"
+    start_time = time.time()
+
+    while True:
+        try:
+            response = requests.get(url, params={"timeout": 30}).json()
+
+            if "result" in response and response["result"]:
+                last_message = response["result"][-1]
+
+                if last_message["message"]["date"] >= start_time:
+                    return last_message["message"]["text"]
+
+            if time.time() - start_time > timeout:
+                raise TimeoutError("Время ожидания ввода капчи истекло")
+
+            time.sleep(1)
+
+        except Exception as e:
+            raise
+
+
 def handle_captcha(driver, config):
-    if driver.find_elements(By.CSS_SELECTOR, "img[data-qa=account-captcha-picture]"):
-        title = 'Обнаружена капча!'
-        logging.warning(title)
-        send_message_telegram(title, config)
-        driver.save_screenshot('captcha.png')
-        # Закомментируй для ввода капчи
-        sys.exit()
-        logging.info("Снимок экрана сохранен - captcha.png")
-        captcha_text = input('Enter captcha:\r\n')
-        driver.find_element(By.CSS_SELECTOR, 'input[data-qa="account-captcha-input"]').send_keys(captcha_text)
-        driver.find_element(By.CSS_SELECTOR, 'button[data-qa="account-login-submit"]').click()
-        sleep(5)
+    count = 0
+    max_attempts = config.get('CAPTCHA_MAX_ATTEMPTS', 3)
+    while count < max_attempts:
+        captcha_element = driver.find_element(By.CSS_SELECTOR, "img[data-qa=account-captcha-picture]")
+        captcha_path = os.path.join(BASE_DIR, 'captcha.png')
+        captcha_element.screenshot(captcha_path)
+
+        send_photo_telegram(captcha_path, config)
+        logging.info("Капча отправлена в Telegram. Ожидаю ответа")
+        try:
+            captcha_text = wait_for_telegram_response(config)
+            logging.info(f"Получен текст капчи: {captcha_text}")
+
+            driver.find_element(By.CSS_SELECTOR, 'input[data-qa="account-captcha-input"]').send_keys(captcha_text)
+            driver.find_element(By.CSS_SELECTOR, 'button[data-qa="account-login-submit"]').click()
+            time.sleep(5)
+
+            if driver.find_elements(By.CSS_SELECTOR, "img[data-qa=account-captcha-picture]"):
+                title = "Капча введена неверно!"
+                send_message_telegram(title, config)
+                logging.error(title)
+                count += 1
+                continue
+            else:
+                title = "Капча введена верно!"
+                send_message_telegram(title, config)
+                logging.info(title)
+                break
+        except Exception as e:
+            raise
+    if count > 3:
+        raise Exception("Слишком много попыток ввода")
 
 
 def login(driver, config):
     driver.find_element(By.CSS_SELECTOR, 'span[data-qa="expand-login-by-password-text"]').click()
     driver.find_element(By.CSS_SELECTOR, 'input[data-qa="login-input-username"]').send_keys(config['EMAIL'])
-    sleep(3)
+    time.sleep(3)
     driver.find_element(By.CSS_SELECTOR, 'input[data-qa="login-input-password"]').send_keys(config['PSWRD'])
     driver.find_element(By.CSS_SELECTOR, 'button[data-qa="account-login-submit"]').click()
-    sleep(5)
+    time.sleep(5)
 
 
 def update_resumes(driver, config):
@@ -116,12 +166,13 @@ def main():
             for cookie in pickle.load(open(COOKIES_FILE, 'rb')):
                 driver.add_cookie(cookie)
         driver.refresh()
-        sleep(5)
+        time.sleep(5)
 
         if driver.find_elements(By.CSS_SELECTOR, 'span[data-qa="expand-login-by-password-text"]'):
             logging.info("Куки устарели, прохожу авторизацию")
             login(driver, config)
-            handle_captcha(driver, config)
+            if driver.find_elements(By.CSS_SELECTOR, "img[data-qa=account-captcha-picture]"):
+                handle_captcha(driver, config)
 
         if driver.find_elements(By.CSS_SELECTOR, 'button[data-qa*="resume-update"]'):
             update_resumes(driver, config)
@@ -132,7 +183,7 @@ def main():
             send_message_telegram(title, config)
 
     except Exception as e:
-        title = f'Ошибка!:\r\n{e}'
+        title = f'Ошибка!\r\n{e}'
         logging.error(title)
         send_message_telegram(title, config)
     finally:
